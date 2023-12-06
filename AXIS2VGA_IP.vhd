@@ -92,18 +92,6 @@ architecture AXIS2VGA_IP_arch of AXIS2VGA_IP is
     constant VAV_START : integer := VSP + VBP;
     constant VAV_END : integer := VAV + VSP + VBP;
     
-    -- Константы для типов объектов в кадре
-    constant PLAYER : integer := 0;
-    constant ENEMY : integer := 1;
-    constant BULLET : integer := 2;
-    constant WALL : integer := 3;
-    
-    -- константы для направления объекта в кадре
-    constant UP : integer := 0;
-    constant RIGHT : integer := 1;
-    constant DOWN : integer := 2;
-    constant LEFT : integer := 3;
-    
     -- константы для цветов
     constant COLOR_RED : std_logic_vector(11 downto 0) := "1111" & "0000" & "0000"; -- стена
     constant COLOR_YELLOW : std_logic_vector(11 downto 0) := "1111" & "1111" & "0000"; -- игрок
@@ -111,6 +99,15 @@ architecture AXIS2VGA_IP_arch of AXIS2VGA_IP is
     constant COLOR_GREEN : std_logic_vector(11 downto 0) := "0000" & "1111" & "0000"; -- враг
     constant COLOR_GRAY : std_logic_vector(11 downto 0) := "1000" & "1000" & "1000"; -- враг
     constant COLOR_BLACK : std_logic_vector(11 downto 0) := "0000" & "0000" & "0000"; -- пустота
+    
+    -- максимально возможное количество динамических объектов в кадре
+    constant MAX_SPRITES_COUNT : integer := 16;
+    
+    -- размер тайла в пикселях
+    constant TILE_SIZE : integer := 16;
+    
+    -- количество возможных текстур (типов объектов)
+    constant OBJECT_TYPES_COUNT : integer := 16;
     
     ---------------------------------------------------------------------------
     -- автомат состояний. Для описания автомата создаем свой перечисляемый тип.
@@ -121,12 +118,20 @@ architecture AXIS2VGA_IP_arch of AXIS2VGA_IP is
 --        SEND -- передача данных
 --    );
     
+--    type state_s is (
+--        IDLE, -- состояние после сброса
+--        SKIP, -- пропуск объектов до нового пакета
+--        GET_OBJECT_H, -- получение координат объекта по горизонтали
+--        GET_OBJECT_V, -- получение координат объекта по вертикали
+--        SEND -- отправка сформированного кадра
+--    );
+
     type state_s is (
-        IDLE, -- состояние после сброса
+        IDLE,  -- состояние после сброса
         SKIP, -- пропуск объектов до нового пакета
-        GET_OBJECT_H, -- получение координат объекта по горизонтали
-        GET_OBJECT_V, -- получение координат объекта по вертикали
-        SEND -- отправка сформированного кадра
+        READ_DYNAMIC, -- получение спрайтов в кадре
+        READ_STATIC, -- получение статических тайлов в кадре
+        SEND -- получение тайлов и отправка формируемого на лету кадра
     );
     
     signal state, next_state : state_s := IDLE;
@@ -136,37 +141,48 @@ architecture AXIS2VGA_IP_arch of AXIS2VGA_IP is
     signal h_cnt : integer range 0 to H_MAX-1 := 0;
     signal v_cnt : integer range 0 to V_MAX-1 := 0;
     
+    -- счетчики координат активной карты
+    signal x_cnt : integer range 0 to HAV-1 := 0;
+    signal y_cnt : integer range 0 to VAV-1 := 0;
+    
     -- флаг активной части кадра.
     signal av : std_logic;
     signal av_d : std_logic;
-    
-    -- возможно, потребуются дополнительные signal 
-    signal object_type : integer range 0 to 15 := 0;
-    signal object_direction : integer range 0 to 15 := 0;
-    signal object_cord_h : integer range 0 to 1023 := 0;
-    signal object_cord_v: integer range 0 to 1023 := 0;
-    
-    
-    -- синонимы для удобства разбора входных данных
-    
---    alias first_f : std_logic is axis_data(13);
---    alias finish_f : std_logic is axis_data(12);
---    alias red : std_logic_vector(3 downto 0) is axis_data(11 downto 8);
---    alias green : std_logic_vector(3 downto 0) is axis_data(7 downto 4);
---    alias blue : std_logic_vector(3 downto 0) is axis_data(3 downto 0);
-    
+     
     alias next_f : std_logic is axis_data(15);
-    alias object_type_or_direction_raw : std_logic_vector(3 downto 0) is axis_data(14 downto 11);
-    alias object_cord_axis : std_logic is axis_data(10);
-    alias object_cord_raw : std_logic_vector(9 downto 0) is axis_data(9 downto 0);
+    alias is_object : std_logic is axis_data(14);
+    alias object_type : std_logic_vector is axis_data(13 downto 11);
+    alias color: std_logic is axis_data(10);
+    alias cord: std_logic_vector is axis_data(9 downto 0);
     
-    -- синонимы нужно перевести в инты...
+    -- текстуры тайлов
+    type TILE_TEXTURES_T is array(0 to OBJECT_TYPES_COUNT-1, 0 to TILE_SIZE-1, 0 to TILE_SIZE-1) of std_logic_vector(11 downto 0);
+    signal tile_textures : TILE_TEXTURES_T := (
+        1 => (others => (others => (others => '1'))),
+        others => (others => (others => (others => '0')))
+    );
     
-    -- матрица для хранения текущего формируемого кадра
-    type FRAME is array (0 to HAV-1, 0 to VAV-1) of std_logic_vector(11 downto 0);
-    signal frame_reg : FRAME := (others => (others => (others => '0')));
+    -- сами тайлы
+    type TILES_T is array(0 to 39, 0 to 29) of integer;
+    signal tiles : TILES_T := (others => (others => 0));
+    signal static_counter_x : integer range 0 to 39 := 0;
+    signal static_counter_y : integer range 0 to 29 := 0;
+    
+    type SPRITES is array (0 to MAX_SPRITES_COUNT-1) of std_logic_vector(9 downto 0);
+    type OBJECT_TYPES is array(0 to MAX_SPRITES_COUNT-1) of std_logic_vector(2 downto 0);
+    
+    signal sprites_xs : SPRITES := (others => (others => '0'));
+    signal sprites_ys : SPRITES := (others => (others => '0'));
+    signal sprites_types : OBJECT_TYPES := (others => (others => '0'));
+    
+    -- счетчик количества динамических объектов для записи их координат в sprites_xs, sprites_ys
+    signal dynamic_counter: integer range 0 to MAX_SPRITES_COUNT-1 := 0;
+    
+    -- flip flop для записи в sprites_xs или sprites_ys
+    signal is_cord_y : std_logic := '0';
     
     signal current_pixel : std_logic_vector(11 downto 0) := "0000" & "0000" & "0000";
+    
     
     begin
         -- регистр автомата состояний
@@ -183,6 +199,15 @@ architecture AXIS2VGA_IP_arch of AXIS2VGA_IP is
         
         -- КС на входе автомата состояний, формирующая следующее состояние
         next_state_p : process(clk, state, axis_valid) 
+            variable tile_x : integer range 0 to 39;
+            variable tile_y : integer range 0 to 29;
+            variable x_logic: std_logic_vector(9 downto 0);
+            variable y_logic: std_logic_vector(9 downto 0);
+            variable current_pixel : std_logic_vector(11 downto 0);
+            variable current_tile: integer range 0 to OBJECT_TYPES_COUNT-1;
+            variable tile_offset_x : integer range 0 to TILE_SIZE-1;
+            variable tile_offset_y : integer range 0 to TILE_SIZE-1;
+            
         begin
             if clk'event and clk = '1' then
                 case state is 
@@ -190,107 +215,84 @@ architecture AXIS2VGA_IP_arch of AXIS2VGA_IP is
                     -- поиска начала кадра во входном потоке
                     when IDLE =>
                         state <= SKIP;
-                    -- когда нашли начало пакета, переходим к получению горизонтальной координаты первого объекта
+                    -- когда нашли начало пакета, переходим к получению динамических объектов
                     when SKIP =>
                         if next_f = '1' and axis_valid = '1' then 
-                            state <= GET_OBJECT_H;
+                            state <= READ_DYNAMIC;
                         else
                             state <= SKIP;
                         end if;
                     -- когда получили горизонтальную координату, переходим к получению вертикальной координаты
-                    when GET_OBJECT_H =>
-                        if next_f = '1' and axis_valid = '1' then 
-                            object_cord_h <= to_integer(unsigned(object_cord_raw));
-                            object_type <= to_integer(unsigned(object_type_or_direction_raw));
-                            state <= GET_OBJECT_V;
+                    when READ_DYNAMIC =>
+                        if next_f = '1' and axis_valid = '1' and dynamic_counter < MAX_SPRITES_COUNT then 
+                            if is_cord_y = '1' then
+                                sprites_ys(dynamic_counter) <= cord;
+                            else 
+                                sprites_xs(dynamic_counter) <= cord;
+                            end if;
+                            
+                            sprites_types(dynamic_counter) <= object_type;
+                            is_cord_y <= not is_cord_y;
+                            dynamic_counter <= dynamic_counter + 1;
                         else 
-                            -- возможно, тут надо переходить в другое состояние, например SKIP, 
-                            -- но непонятно, может ли быть так, что пакет разорвётся на части
-                            -- и к модулю данные будут приходить разрозненными кусками
-                            -- именно на такой случай мы остаёмся в текущем состоянии, если пришла какая-то фигня
-                            -- и ждём следующих нормальных данных
-                            --next_state <= GET_OBJECT_H;
-                            -- пока попробуем переходить в состояние SEND
+                            state <= READ_STATIC;
+                            dynamic_counter <= 0;
+                        end if;
+                    when READ_STATIC =>
+                        if next_f = '1' and axis_valid = '1' then 
+                            tiles(static_counter_x, static_counter_y) <= conv_integer(object_type);
+                            
+                            if static_counter_x = 39 then
+                                static_counter_y <= static_counter_y + 1;
+                                static_counter_x <= 0;
+                            else
+                                static_counter_x <= static_counter_x + 1;
+                            end if;
+                            
+                        else
                             state <= SEND;
                         end if;
-                    -- когда получили вертикальную координату
-                    when GET_OBJECT_V =>
-                        if axis_valid = '1' then
-                            object_cord_v <= to_integer(unsigned(object_cord_raw));
-                            object_direction <= to_integer(unsigned(object_type_or_direction_raw));
-                            
-                            -- логика формирования изображения объекта на кадре
-                            case object_type is
-                                when PLAYER =>
-                                    -- в цикле для всех соответствующих пикселей присвоить нужные цвета
-                                    -- вопрос: как делать поворот?
-                                        -- пока не особо важно
-                                    -- заполнить 10x10 пикселей цветом
-                                    for i in 0 to 9 loop
-                                        for j in 0 to 9 loop
-                                            frame_reg(
-                                                object_cord_h + i, 
-                                                to_integer(unsigned(object_cord_raw)) + j
-                                            ) <= COLOR_YELLOW;
-                                        end loop;
-                                    end loop;
-                                    
-                                when ENEMY =>
-                                    for i in 0 to 9 loop
-                                        for j in 0 to 9 loop
-                                            frame_reg(
-                                                object_cord_h + i, 
-                                                to_integer(unsigned(object_cord_raw)) + j
-                                            ) <= COLOR_GRAY;
-                                        end loop;
-                                    end loop;
-                                when BULLET =>
-                                    -- frame_reg[h][v] <- white
-                                    frame_reg(object_cord_h, to_integer(unsigned(object_cord_raw))) <= COLOR_WHITE;
-                                when WALL =>
-                                    for i in 0 to 9 loop
-                                        for j in 0 to 9 loop
-                                            frame_reg(
-                                                object_cord_h + i, 
-                                                to_integer(unsigned(object_cord_raw)) + j
-                                            ) <= COLOR_RED;
-                                        end loop;
-                                    end loop;
-                                when others =>
-                                    frame_reg(object_cord_h, to_integer(unsigned(object_cord_raw))) <= COLOR_BLACK;
-                            end case;
-                            -- если есть ещё объекты, переходим к получению горизонтальной координаты следующего объекта
-                            if next_f = '1' then
-                                state <= GET_OBJECT_H;
-                            -- если нет больше объектов, переходим к отправке сформированного кадра
-                            else
-                                state <= SEND;
-                            end if;
-                        else
-                            state <= GET_OBJECT_V;
-                        end if;
                     when SEND =>
-                        -- если были переданы все пиксели, переходим к ожиданию следующего пакета
-                        if (h_cnt = HAV_END and v_cnt = VAV_END) then
-                            state <= SKIP;
-                        else
-                            
+                        if next_f = '1' and axis_valid = '1' then
+                            -- todo проверять, есть ли пересечение с динамическим объектом                
                             if av = '1' then 
                                 -- передаём очередной пиксель из кадра
-                                vga_red <= frame_reg(h_cnt - HAV_START, v_cnt - VAV_START)(11 downto 8);
-                                vga_green <= frame_reg(h_cnt - HAV_START, v_cnt - VAV_START)(7 downto 4);
-                                vga_blue <= frame_reg(h_cnt - HAV_START, v_cnt - VAV_START)(3 downto 0);
+                                x_logic := std_logic_vector(to_unsigned(x_cnt, 10));
+                                y_logic := std_logic_vector(to_unsigned(y_cnt, 10));
+                                
+                                tile_x := conv_integer(x_logic(9 downto 4));
+                                tile_y := conv_integer(y_logic(9 downto 4));
+                                
+                                current_tile := tiles(tile_x, tile_y);
+                                
+                                tile_offset_x := conv_integer(x_logic(3 downto 0));
+                                tile_offset_y := conv_integer(y_logic(3 downto 0));
+                                
+                                current_pixel := tile_textures(current_tile, tile_offset_x, tile_offset_y);
+                                
+                                vga_red <= current_pixel(11 downto 8);
+                                vga_green <= current_pixel(7 downto 4);
+                                vga_blue <= current_pixel(3 downto 0);
+                                
+                                
+                                if x_cnt = HAV-1 then 
+                                    y_cnt <= y_cnt + 1;
+                                    x_cnt <= 0;
+                                else
+                                    x_cnt <= x_cnt + 1;
+                                end if;
+                                
+--                                vga_red <=                        std_logic_vector(to_unsigned(y_cnt(9 downto 4), 6)) , x_cnt, y_cnt)(11 downto 8);
+--                                vga_green <= tile_textures(conv_integer(object_type), x_cnt, y_cnt)(7 downto 4);
+--                                vga_blue <= tile_textures(conv_integer(object_type), x_cnt, y_cnt)(3 downto 0);
                             else 
                                 -- иначе мы находимся вне активной зоны, передаём нули
                                 vga_red <= "0000";
                                 vga_green <= "0000";
                                 vga_blue <= "0000";
                             end if;
+                        end if;
     
-    --                            vga_red <= "0000";
-    --                            vga_green <= "0000";
-    --                            vga_blue <= "0000";
-                            
                             if reset_n = '0' then
                                 h_cnt <= 0;
                                 v_cnt <= 0;
@@ -306,9 +308,7 @@ architecture AXIS2VGA_IP_arch of AXIS2VGA_IP is
                                     h_cnt <= h_cnt + 1;
                                 end if;
                             end if;
-                            
-                            state <= SEND;
-                        end if;
+                        
                         
                 end case;
             else 
